@@ -16,6 +16,7 @@ function broadcast(roomId, message, except) {
 }
 
 wss.on('connection', (ws, req) => {
+  console.log('NEW CLIENT CONNECTED'); 
   const url = new URL(req.url, `http://${req.headers.host}`);
   const room = url.searchParams.get('room') || 'lobby';
 
