@@ -213,10 +213,12 @@ function notifyPatientConnected(clientId) {
 }
 
 function notifyPatientDisconnected(clientId) {
+  const disconnectedAt = Date.now();
   const disconnectMessage = {
     type: "patientDisconnected",
     clientId: clientId,
-    timestamp: Date.now(),
+    timestamp: disconnectedAt,
+    disconnectedAt: disconnectedAt,
   };
 
   broadcast("dashboard", JSON.stringify(disconnectMessage));
@@ -246,7 +248,11 @@ function sendCurrentStateToStaff(staffWs) {
         status: clientInfo.status || "online",
         joinedAt: clientInfo.joinedAt,
         lastActivity: clientInfo.lastActivity,
-        summary: summary, // Include the form data!
+        summary: summary,
+        disconnectedAt:
+          clientInfo.status === "disconnected"
+            ? clientInfo.lastActivity
+            : undefined,
       });
     }
   });
@@ -361,33 +367,37 @@ function handleStatusUpdate(ws, msg) {
 function handleFormSubmit(msg, sourceRoom) {
   log("INFO", `✅ Form submitted by "${msg.clientId}"`);
 
-  // UPDATED: Store the submission with submitted flag
+  const submittedAt = Date.now();
   const submittedData = {
     ...msg.payload,
     submitted: true,
-    submittedAt: Date.now(),
+    submittedAt: submittedAt,
     progress: msg.payload?.progress ?? 100,
   };
 
   patientSummaries.set(msg.clientId, submittedData);
 
-  // Forward to dashboard if not from dashboard
+  // Broadcast to patient's room (for staff in live view)
   if (sourceRoom !== "dashboard") {
-    const submitNotification = {
-      type: "summary",
-      clientId: msg.clientId,
-      payload: {
-        firstName: submittedData.firstName || null,
-        lastName: submittedData.lastName || null,
-        progress: 100,
-        submitted: true,
-      },
-      timestamp: msg.timestamp || Date.now(),
-    };
-
-    broadcast("dashboard", JSON.stringify(submitNotification));
-    log("INFO", `📤 Notified dashboard of submission for "${msg.clientId}"`);
+    broadcast(sourceRoom, JSON.stringify(msg));
   }
+
+  // Forward to dashboard with submittedAt timestamp
+  const submitNotification = {
+    type: "summary",
+    clientId: msg.clientId,
+    payload: {
+      firstName: submittedData.firstName || null,
+      lastName: submittedData.lastName || null,
+      progress: 100,
+      submitted: true,
+      submittedAt: submittedAt,
+    },
+    timestamp: submittedAt,
+  };
+
+  broadcast("dashboard", JSON.stringify(submitNotification));
+  log("INFO", `📤 Notified dashboard of submission for "${msg.clientId}"`);
 }
 
 // ============================================================================
@@ -553,12 +563,28 @@ const statsInterval = setInterval(() => {
   }
 }, CONFIG.STATS_INTERVAL);
 
+// Cleanup old submitted records periodically
+const cleanupInterval = setInterval(() => {
+  const now = Date.now();
+  const CLEANUP_AGE = 60000; // 1 minute
+
+  patientSummaries.forEach((summary, clientId) => {
+    if (summary.submitted && summary.submittedAt) {
+      if (now - summary.submittedAt > CLEANUP_AGE) {
+        patientSummaries.delete(clientId);
+        log("INFO", `🧹 Cleaned up old submitted record for "${clientId}"`);
+      }
+    }
+  });
+}, 30000);
+
 // Graceful shutdown handler
 function shutdown(signal) {
   log("INFO", `${signal} received - shutting down gracefully...`);
 
   clearInterval(heartbeatInterval);
   clearInterval(statsInterval);
+  clearInterval(cleanupInterval);
 
   // Notify all clients about shutdown
   wss.clients.forEach((ws) => {
