@@ -230,44 +230,72 @@ function notifyPatientDisconnected(clientId) {
 }
 
 function sendCurrentStateToStaff(staffWs) {
-  // Collect all currently active patients from dashboard room
-  const dashboardRoom = rooms.get("dashboard");
-  if (!dashboardRoom) return;
-
   const activePatients = [];
+  const dashboardRoom = rooms.get("dashboard");
+  const includedPatientIds = new Set();
 
-  // Find all patient connections (not staff)
-  dashboardRoom.forEach((ws) => {
-    const clientInfo = clients.get(ws);
-    if (
-      clientInfo &&
-      clientInfo.clientId &&
-      !clientInfo.clientId.startsWith("staff-") // UPDATED: Check if NOT staff
-    ) {
-      // Get the stored summary for this patient
-      const summary = patientSummaries.get(clientInfo.clientId) || {};
+  // STEP 1: Get all CONNECTED patients from dashboard room (including idle ones)
+  if (dashboardRoom) {
+    dashboardRoom.forEach((ws) => {
+      const clientInfo = clients.get(ws);
+      if (
+        clientInfo &&
+        clientInfo.clientId &&
+        !clientInfo.clientId.startsWith("staff-")
+      ) {
+        // Get the stored summary for this patient
+        const summary = patientSummaries.get(clientInfo.clientId) || {};
 
+        activePatients.push({
+          clientId: clientInfo.clientId,
+          status: clientInfo.status || "online",
+          joinedAt: clientInfo.joinedAt,
+          lastActivity: clientInfo.lastActivity,
+          summary: summary,
+          disconnectedAt: undefined, // They're connected, so no disconnect time
+        });
+
+        includedPatientIds.add(clientInfo.clientId);
+        log(
+          "INFO",
+          `   - Including connected patient "${clientInfo.clientId}" (status: ${clientInfo.status})`
+        );
+      }
+    });
+  }
+
+  // STEP 2: Add SUBMITTED patients that might not be connected anymore
+  patientSummaries.forEach((summary, clientId) => {
+    // Skip if already included or if it's a staff member
+    if (includedPatientIds.has(clientId) || clientId.startsWith("staff-")) {
+      return;
+    }
+
+    // Only include if submitted (disconnected non-submitted patients should disappear)
+    if (summary.submitted) {
       activePatients.push({
-        clientId: clientInfo.clientId,
-        status: clientInfo.status || "online",
-        joinedAt: clientInfo.joinedAt,
-        lastActivity: clientInfo.lastActivity,
+        clientId: clientId,
+        status: "online", // Keep as online for submitted patients
+        joinedAt: summary.submittedAt || Date.now(),
+        lastActivity: summary.submittedAt || Date.now(),
         summary: summary,
-        disconnectedAt:
-          clientInfo.status === "disconnected"
-            ? clientInfo.lastActivity
-            : undefined,
+        disconnectedAt: undefined,
       });
+
+      includedPatientIds.add(clientId);
+      log(
+        "INFO",
+        `   - Including submitted patient "${clientId}" (disconnected)`
+      );
     }
   });
 
   if (activePatients.length > 0) {
     log(
       "INFO",
-      `📋 Sending ${activePatients.length} active patients to new staff connection`
+      `📋 Sending ${activePatients.length} patients to new staff connection`
     );
 
-    // Send initial state message
     try {
       staffWs.send(
         JSON.stringify({
@@ -279,6 +307,8 @@ function sendCurrentStateToStaff(staffWs) {
     } catch (err) {
       log("ERROR", "Failed to send initial state:", err);
     }
+  } else {
+    log("INFO", "📋 No patients to send to staff (empty dashboard)");
   }
 }
 
@@ -389,7 +419,9 @@ function handleFormSubmit(msg, sourceRoom) {
     progress: msg.payload?.progress ?? 100,
   };
 
+  // IMPORTANT: Store in patientSummaries so it persists
   patientSummaries.set(msg.clientId, submittedData);
+  log("INFO", `💾 Stored submitted form for "${msg.clientId}"`);
 
   // Broadcast to patient's room (for staff in live view)
   if (sourceRoom !== "dashboard") {
