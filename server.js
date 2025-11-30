@@ -72,10 +72,13 @@ function broadcast(roomId, message, except) {
 function sendCurrentSnapshotToClient(ws, patientId) {
   // Get the stored summary for this patient
   const summary = patientSummaries.get(patientId);
-  
+
   if (summary) {
-    log("INFO", `📋 Sending current snapshot to new client in room "${patientId}"`);
-    
+    log(
+      "INFO",
+      `📋 Sending current snapshot to new client in room "${patientId}"`
+    );
+
     try {
       ws.send(
         JSON.stringify({
@@ -119,13 +122,16 @@ function addClientToRoom(ws, room, clientId) {
   if (clientId && room === "dashboard" && clientId !== "staff-dashboard") {
     notifyPatientConnected(clientId);
   }
-  
+
   // NEW: When someone joins a patient room (not dashboard), send them the current snapshot
   // This handles staff joining to view live data
   if (room !== "dashboard" && room !== "lobby") {
     // If this is not the first client (patient) in the room, it's likely staff joining
     if (roomSize > 0) {
-      log("INFO", `New viewer joined patient room "${room}", sending current state`);
+      log(
+        "INFO",
+        `New viewer joined patient room "${room}", sending current state`
+      );
       // Small delay to ensure connection is established
       setTimeout(() => {
         sendCurrentSnapshotToClient(ws, room);
@@ -154,10 +160,15 @@ function removeClientFromRoom(ws) {
 
   clients.delete(ws);
 
-  // Clean up stored summary when patient disconnects from dashboard
+  // UPDATED: Don't delete summaries for submitted patients
   if (clientId && room === "dashboard" && clientId !== "staff-dashboard") {
-    patientSummaries.delete(clientId);
-    log("INFO", `Cleared summary data for "${clientId}"`);
+    const summary = patientSummaries.get(clientId);
+    if (summary && summary.submitted) {
+      log("INFO", `Keeping submitted summary for "${clientId}"`);
+    } else {
+      patientSummaries.delete(clientId);
+      log("INFO", `Cleared summary data for "${clientId}"`);
+    }
   }
 
   log(
@@ -350,23 +361,32 @@ function handleStatusUpdate(ws, msg) {
 function handleFormSubmit(msg, sourceRoom) {
   log("INFO", `✅ Form submitted by "${msg.clientId}"`);
 
+  // UPDATED: Store the submission with submitted flag
+  const submittedData = {
+    ...msg.payload,
+    submitted: true,
+    submittedAt: Date.now(),
+    progress: msg.payload?.progress ?? 100,
+  };
+
+  patientSummaries.set(msg.clientId, submittedData);
+
   // Forward to dashboard if not from dashboard
   if (sourceRoom !== "dashboard") {
     const submitNotification = {
       type: "summary",
       clientId: msg.clientId,
       payload: {
-        ...msg.payload,
+        firstName: submittedData.firstName || null,
+        lastName: submittedData.lastName || null,
         progress: 100,
         submitted: true,
       },
       timestamp: msg.timestamp || Date.now(),
     };
 
-    // Update stored summary
-    patientSummaries.set(msg.clientId, msg.payload);
-
     broadcast("dashboard", JSON.stringify(submitNotification));
+    log("INFO", `📤 Notified dashboard of submission for "${msg.clientId}"`);
   }
 }
 
@@ -524,7 +544,12 @@ const statsInterval = setInterval(() => {
 
   // Log stored summaries
   if (patientSummaries.size > 0) {
-    log("INFO", `   Stored summaries for: ${Array.from(patientSummaries.keys()).join(", ")}`);
+    log(
+      "INFO",
+      `   Stored summaries for: ${Array.from(patientSummaries.keys()).join(
+        ", "
+      )}`
+    );
   }
 }, CONFIG.STATS_INTERVAL);
 
