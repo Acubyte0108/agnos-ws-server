@@ -10,6 +10,7 @@ const CONFIG = {
 
 const rooms = new Map(); // Map<roomId, Set<ws>>
 const clients = new Map(); // Map<ws, { ws, room, clientId, joinedAt, lastActivity, status }>
+const patientSummaries = new Map(); // Map<clientId, latestFormSummary>
 
 // ============================================================================
 // Helper Functions
@@ -67,12 +68,38 @@ function broadcast(roomId, message, except) {
   }
 }
 
+// NEW: Send current snapshot to a specific client (staff joining patient room)
+function sendCurrentSnapshotToClient(ws, patientId) {
+  // Get the stored summary for this patient
+  const summary = patientSummaries.get(patientId);
+  
+  if (summary) {
+    log("INFO", `📋 Sending current snapshot to new client in room "${patientId}"`);
+    
+    try {
+      ws.send(
+        JSON.stringify({
+          type: "formSnapshot",
+          clientId: patientId,
+          payload: summary,
+          timestamp: Date.now(),
+        })
+      );
+    } catch (err) {
+      log("ERROR", "Failed to send snapshot to client:", err);
+    }
+  } else {
+    log("INFO", `No snapshot available for patient "${patientId}"`);
+  }
+}
+
 function addClientToRoom(ws, room, clientId) {
   if (!rooms.has(room)) {
     rooms.set(room, new Set());
     log("INFO", `Created new room: "${room}"`);
   }
 
+  const roomSize = rooms.get(room).size;
   rooms.get(room).add(ws);
 
   clients.set(ws, {
@@ -91,6 +118,19 @@ function addClientToRoom(ws, room, clientId) {
   // Staff-dashboard is excluded
   if (clientId && room === "dashboard" && clientId !== "staff-dashboard") {
     notifyPatientConnected(clientId);
+  }
+  
+  // NEW: When someone joins a patient room (not dashboard), send them the current snapshot
+  // This handles staff joining to view live data
+  if (room !== "dashboard" && room !== "lobby") {
+    // If this is not the first client (patient) in the room, it's likely staff joining
+    if (roomSize > 0) {
+      log("INFO", `New viewer joined patient room "${room}", sending current state`);
+      // Small delay to ensure connection is established
+      setTimeout(() => {
+        sendCurrentSnapshotToClient(ws, room);
+      }, 100);
+    }
   }
 }
 
@@ -113,6 +153,13 @@ function removeClientFromRoom(ws) {
   }
 
   clients.delete(ws);
+
+  // Clean up stored summary when patient disconnects from dashboard
+  if (clientId && room === "dashboard" && clientId !== "staff-dashboard") {
+    patientSummaries.delete(clientId);
+    log("INFO", `Cleared summary data for "${clientId}"`);
+  }
+
   log(
     "INFO",
     `Client "${clientId || "anonymous"}" disconnected from room "${room}"`
@@ -180,11 +227,15 @@ function sendCurrentStateToStaff(staffWs) {
       clientInfo.clientId &&
       clientInfo.clientId !== "staff-dashboard"
     ) {
+      // Get the stored summary for this patient
+      const summary = patientSummaries.get(clientInfo.clientId) || {};
+
       activePatients.push({
         clientId: clientInfo.clientId,
         status: clientInfo.status || "online",
         joinedAt: clientInfo.joinedAt,
         lastActivity: clientInfo.lastActivity,
+        summary: summary, // Include the form data!
       });
     }
   });
@@ -252,6 +303,12 @@ function handleMessage(ws, data) {
 }
 
 function handleFormUpdate(msg, sourceRoom) {
+  // Store full snapshot for patient rooms (for staff live view)
+  if (sourceRoom !== "dashboard" && msg.type === "formSnapshot") {
+    patientSummaries.set(msg.clientId, msg.payload);
+    log("INFO", `💾 Stored full snapshot for "${msg.clientId}"`);
+  }
+
   // Don't forward dashboard messages back to dashboard
   if (sourceRoom === "dashboard") return;
 
@@ -267,6 +324,9 @@ function handleFormUpdate(msg, sourceRoom) {
     },
     timestamp: msg.timestamp || Date.now(),
   };
+
+  // Store the latest summary for this patient
+  patientSummaries.set(msg.clientId, msg.payload);
 
   broadcast("dashboard", JSON.stringify(summary));
   log(
@@ -302,6 +362,9 @@ function handleFormSubmit(msg, sourceRoom) {
       },
       timestamp: msg.timestamp || Date.now(),
     };
+
+    // Update stored summary
+    patientSummaries.set(msg.clientId, msg.payload);
 
     broadcast("dashboard", JSON.stringify(submitNotification));
   }
@@ -374,7 +437,7 @@ wss.on("connection", (ws, req) => {
 
   addClientToRoom(ws, room, clientId);
 
-  // NEW: Send current state to staff when they join dashboard
+  // Send current state to staff when they join dashboard
   if (room === "dashboard" && clientId === "staff-dashboard") {
     // Give a small delay to ensure connection is fully established
     setTimeout(() => {
@@ -441,7 +504,7 @@ const heartbeatInterval = setupHeartbeat();
 const statsInterval = setInterval(() => {
   log(
     "INFO",
-    `📊 Server stats - Rooms: ${rooms.size}, Total clients: ${clients.size}`
+    `📊 Server stats - Rooms: ${rooms.size}, Total clients: ${clients.size}, Stored summaries: ${patientSummaries.size}`
   );
 
   // Log room details
@@ -458,6 +521,11 @@ const statsInterval = setInterval(() => {
       `   Room "${roomId}": ${clientSet.size} client(s) - [${clientList}]`
     );
   });
+
+  // Log stored summaries
+  if (patientSummaries.size > 0) {
+    log("INFO", `   Stored summaries for: ${Array.from(patientSummaries.keys()).join(", ")}`);
+  }
 }, CONFIG.STATS_INTERVAL);
 
 // Graceful shutdown handler
