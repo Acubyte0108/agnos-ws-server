@@ -526,7 +526,8 @@ const heartbeatInterval = setupHeartbeat();
 
 // Periodic stats logging
 const statsInterval = setInterval(() => {
-  log("INFO", `📊 Rooms: ${rooms.size}, Clients: ${clients.size}, Patients: ${dashboardSnapshots.size}`);
+  const staffCount = Array.from(clients.values()).filter(c => c.clientId?.startsWith("staff-")).length;
+  log("INFO", `📊 Rooms: ${rooms.size}, Clients: ${clients.size}, Staff: ${staffCount}, Patients: ${dashboardSnapshots.size}`);
 }, CONFIG.STATS_INTERVAL);
 
 // Failsafe cleanup for very old records
