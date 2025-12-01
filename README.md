@@ -24,3 +24,7 @@ For development with auto-reload:
 ```bash
 npm run dev
 ```
+
+### Environment Variables
+
+- `PORT` - Server port (default: 4000)
