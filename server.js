@@ -63,24 +63,42 @@ function broadcast(roomId, message, except) {
 }
 
 // Send current snapshot to a specific client (staff joining patient room)
+// Send current snapshot to a specific client (staff joining patient room)
 function sendCurrentSnapshotToClient(ws, patientId) {
   const summary = patientSummaries.get(patientId);
+  const dashboardData = dashboardSnapshots.get(patientId);
 
-  if (summary) {
+  if (summary || dashboardData) {
     log(
       "INFO",
       `📋 Sending current snapshot to new client in room "${patientId}"`
     );
 
     try {
-      ws.send(
-        JSON.stringify({
-          type: "formSnapshot",
-          clientId: patientId,
-          payload: summary,
-          timestamp: Date.now(),
-        })
-      );
+      // Send form snapshot if available
+      if (summary) {
+        ws.send(
+          JSON.stringify({
+            type: "formSnapshot",
+            clientId: patientId,
+            payload: summary,
+            timestamp: Date.now(),
+          })
+        );
+      }
+
+      // ALSO send current status
+      if (dashboardData && dashboardData.status) {
+        ws.send(
+          JSON.stringify({
+            type: "status",
+            clientId: patientId,
+            state: dashboardData.status,
+            timestamp: Date.now(),
+          })
+        );
+        log("INFO", `📋 Sent current status: ${dashboardData.status}`);
+      }
     } catch (err) {
       log("ERROR", "Failed to send snapshot to client:", err);
     }
@@ -196,17 +214,57 @@ function addClientToRoom(ws, room, clientId) {
       );
     }
 
-    // Create or update dashboard snapshot for this patient
-    const existingSnapshot = dashboardSnapshots.get(clientId) || {};
-    const initialSnapshot = {
+    // IMPORTANT: Get existing snapshot to preserve summary data
+    const existingSnapshot = dashboardSnapshots.get(clientId);
+
+    // Check if we have data in patientSummaries (from patient room)
+    const patientData = patientSummaries.get(clientId);
+
+    // Determine what summary to use
+    let summary = {};
+    if (
+      existingSnapshot?.summary &&
+      Object.keys(existingSnapshot.summary).length > 0
+    ) {
+      // Preserve existing summary if it exists and has data
+      summary = existingSnapshot.summary;
+      log(
+        "INFO",
+        `Preserving existing summary for "${clientId}" with progress: ${
+          summary.progress || 0
+        }`
+      );
+    } else if (patientData) {
+      // Use patient room data if available
+      summary = {
+        firstName: patientData.firstName || null,
+        lastName: patientData.lastName || null,
+        progress: patientData.progress || 0,
+        submitted: patientData.submitted || false,
+      };
+      log(
+        "INFO",
+        `Using patient room data for "${clientId}" with progress: ${
+          summary.progress || 0
+        }`
+      );
+    }
+
+    const reconnectSnapshot = {
       ...existingSnapshot,
       clientId: clientId,
       status: "online",
-      joinedAt: Date.now(),
+      joinedAt: existingSnapshot?.joinedAt || Date.now(),
       lastActivity: Date.now(),
-      summary: existingSnapshot.summary || {},
+      summary: summary, // Use preserved or existing summary
     };
-    dashboardSnapshots.set(clientId, initialSnapshot);
+
+    dashboardSnapshots.set(clientId, reconnectSnapshot);
+    log(
+      "INFO",
+      `Updated dashboard snapshot for "${clientId}"`,
+      reconnectSnapshot
+    );
 
     notifyPatientConnected(clientId);
   }
@@ -262,8 +320,18 @@ function removeClientFromRoom(ws) {
       });
     }
 
-    // Notify staff of disconnection immediately
+    // Notify staff of disconnection in DASHBOARD room
     notifyPatientDisconnected(clientId);
+
+    // ALSO broadcast disconnect status to PATIENT'S individual room (for live view)
+    const disconnectStatusMessage = JSON.stringify({
+      type: "status",
+      clientId: clientId,
+      state: "disconnected",
+      timestamp: Date.now(),
+    });
+    broadcast(clientId, disconnectStatusMessage); // Broadcast to patient's own room
+    log("INFO", `📢 Broadcasted disconnect status to patient room "${clientId}"`);
 
     // Schedule removal after delay (unless already submitted)
     if (!snapshot?.summary?.submitted) {
@@ -371,40 +439,38 @@ function handleFormUpdate(msg, sourceRoom) {
     };
     patientSummaries.set(msg.clientId, updatedSummary);
     log("INFO", `💾 Updated patient room snapshot for "${msg.clientId}"`);
+
+    return;
   }
 
-  // Don't forward dashboard messages back to dashboard
-  if (sourceRoom === "dashboard") return;
+  // HANDLE SUMMARY MESSAGES FROM DASHBOARD ROOM (patient sending their own summary)
+  if (sourceRoom === "dashboard" && msg.type === "summary") {
+    const existingDashboardData = dashboardSnapshots.get(msg.clientId) || {};
+    const updatedSnapshot = {
+      ...existingDashboardData,
+      clientId: msg.clientId,
+      summary: msg.payload,
+      lastActivity: Date.now(),
+      status: existingDashboardData.status || "online",
+      joinedAt: existingDashboardData.joinedAt || Date.now(),
+    };
 
-  // Create lightweight summary for dashboard
-  const summary = {
-    type: "summary",
-    clientId: msg.clientId,
-    payload: {
-      firstName: msg.payload?.firstName || null,
-      lastName: msg.payload?.lastName || null,
-      progress: msg.payload?.progress ?? 0,
-      submitted: msg.payload?.submitted || false,
-      submittedAt: msg.payload?.submittedAt,
-    },
-    timestamp: msg.timestamp || Date.now(),
-  };
+    dashboardSnapshots.set(msg.clientId, updatedSnapshot);
+    log(
+      "INFO",
+      `💾 Updated dashboard snapshot from dashboard summary for "${msg.clientId}":`,
+      updatedSnapshot
+    );
 
-  // UPDATE DASHBOARD SNAPSHOT
-  const existingDashboardData = dashboardSnapshots.get(msg.clientId) || {};
-  dashboardSnapshots.set(msg.clientId, {
-    ...existingDashboardData,
-    clientId: msg.clientId,
-    summary: summary.payload,
-    lastActivity: Date.now(),
-    status: existingDashboardData.status || "online",
-    joinedAt: existingDashboardData.joinedAt || Date.now(),
-  });
-  log("INFO", `💾 Updated dashboard snapshot for "${msg.clientId}"`);
+    broadcast("dashboard", JSON.stringify(msg));
+    console.log("=== handleFormUpdate END (dashboard summary path) ===");
+    return;
+  }
 
-  // Broadcast to dashboard room
-  broadcast("dashboard", JSON.stringify(summary));
-  log("INFO", `📊 Forwarded summary to dashboard for "${msg.clientId}"`);
+  // Don't forward other dashboard messages back to dashboard
+  if (sourceRoom === "dashboard") {
+    return;
+  }
 }
 
 function handleStatusUpdate(ws, msg) {
