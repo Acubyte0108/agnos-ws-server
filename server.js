@@ -2,35 +2,37 @@ import { WebSocketServer } from "ws";
 
 const CONFIG = {
   PORT: process.env.PORT ? Number(process.env.PORT) : 4000,
-  HEARTBEAT_INTERVAL: 30000, // 30 seconds
-  CLIENT_TIMEOUT: 60000, // 60 seconds
-  STATS_INTERVAL: 60000, // Log stats every 60 seconds
-  REMOVAL_DELAY: 20000, // 20 seconds before removing disconnected/submitted patients
+  HEARTBEAT_INTERVAL: 30000,
+  CLIENT_TIMEOUT: 60000,
+  STATS_INTERVAL: 60000,
+  REMOVAL_DELAY: 20000,
 };
 
-const rooms = new Map(); // Map<roomId, Set<ws>>
-const clients = new Map(); // Map<ws, { ws, room, clientId, joinedAt, lastActivity, status }>
-const patientSummaries = new Map(); // Map<clientId, latestFormSummary> - for patient rooms
-const dashboardSnapshots = new Map(); // Map<clientId, dashboardData> - for dashboard room
-const removalTimers = new Map(); // Map<clientId, timeoutId> - track scheduled removals
+const rooms = new Map();
+const clients = new Map();
+const patientSummaries = new Map();
+const dashboardSnapshots = new Map();
+const removalTimers = new Map();
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
+/**
+ * Logs messages with timestamp and level
+ */
 function log(level, message, ...args) {
   const timestamp = new Date().toISOString();
   console.log(`[${timestamp}] [${level}]`, message, ...args);
 }
 
+/**
+ * Parses and validates incoming WebSocket messages
+ * Returns null if message is invalid
+ */
 function parseMessage(data) {
   try {
     const raw = typeof data === "string" ? data : data.toString();
     const msg = JSON.parse(raw);
 
-    // Basic validation
     if (!msg.type || !msg.clientId) {
-      log("WARN", "Invalid message format - missing type or clientId");
+      log("WARN", "Invalid message - missing type or clientId");
       return null;
     }
 
@@ -41,6 +43,9 @@ function parseMessage(data) {
   }
 }
 
+/**
+ * Broadcasts a message to all clients in a room (except sender)
+ */
 function broadcast(roomId, message, except) {
   const roomClients = rooms.get(roomId);
   if (!roomClients) return;
@@ -52,139 +57,98 @@ function broadcast(roomId, message, except) {
         client.send(message);
         sentCount++;
       } catch (err) {
-        log("ERROR", `Failed to send to client in room ${roomId}:`, err);
+        log("ERROR", `Broadcast failed in room ${roomId}:`, err);
       }
     }
   }
-
-  if (sentCount > 0) {
-    log("INFO", `Broadcast to room "${roomId}": ${sentCount} clients`);
-  }
 }
 
-// Send current snapshot to a specific client (staff joining patient room)
-// Send current snapshot to a specific client (staff joining patient room)
+/**
+ * Sends the current patient form snapshot and status to a new viewer
+ * Called when staff joins a patient's individual room
+ */
 function sendCurrentSnapshotToClient(ws, patientId) {
   const summary = patientSummaries.get(patientId);
   const dashboardData = dashboardSnapshots.get(patientId);
 
-  if (summary || dashboardData) {
-    log(
-      "INFO",
-      `📋 Sending current snapshot to new client in room "${patientId}"`
-    );
+  if (!summary && !dashboardData) return;
 
-    try {
-      // Send form snapshot if available
-      if (summary) {
-        ws.send(
-          JSON.stringify({
-            type: "formSnapshot",
-            clientId: patientId,
-            payload: summary,
-            timestamp: Date.now(),
-          })
-        );
-      }
-
-      // ALSO send current status
-      if (dashboardData && dashboardData.status) {
-        ws.send(
-          JSON.stringify({
-            type: "status",
-            clientId: patientId,
-            state: dashboardData.status,
-            timestamp: Date.now(),
-          })
-        );
-        log("INFO", `📋 Sent current status: ${dashboardData.status}`);
-      }
-    } catch (err) {
-      log("ERROR", "Failed to send snapshot to client:", err);
+  try {
+    if (summary) {
+      ws.send(JSON.stringify({
+        type: "formSnapshot",
+        clientId: patientId,
+        payload: summary,
+        timestamp: Date.now(),
+      }));
     }
-  } else {
-    log("INFO", `No snapshot available for patient "${patientId}"`);
+
+    if (dashboardData?.status) {
+      ws.send(JSON.stringify({
+        type: "status",
+        clientId: patientId,
+        state: dashboardData.status,
+        timestamp: Date.now(),
+      }));
+    }
+  } catch (err) {
+    log("ERROR", "Failed to send snapshot:", err);
   }
 }
 
-// Send complete dashboard snapshot to staff
+/**
+ * Sends the complete list of active patients to staff joining dashboard
+ * Includes all patient summaries, statuses, and metadata
+ */
 function sendDashboardSnapshot(staffWs) {
-  const activePatients = [];
+  const activePatients = Array.from(dashboardSnapshots.values());
+  
+  if (activePatients.length === 0) return;
 
-  // Get ALL patients from dashboard snapshots
-  dashboardSnapshots.forEach((snapshot, clientId) => {
-    activePatients.push(snapshot);
-    log("INFO", `   - Including patient "${clientId}" from dashboard snapshot`);
-  });
-
-  if (activePatients.length > 0) {
-    log(
-      "INFO",
-      `📋 Sending dashboard snapshot with ${activePatients.length} patients`
-    );
-
-    try {
-      staffWs.send(
-        JSON.stringify({
-          type: "initialState",
-          payload: activePatients,
-          timestamp: Date.now(),
-        })
-      );
-    } catch (err) {
-      log("ERROR", "Failed to send dashboard snapshot:", err);
-    }
-  } else {
-    log("INFO", "📋 Dashboard snapshot is empty");
+  try {
+    staffWs.send(JSON.stringify({
+      type: "initialState",
+      payload: activePatients,
+      timestamp: Date.now(),
+    }));
+  } catch (err) {
+    log("ERROR", "Failed to send dashboard snapshot:", err);
   }
 }
 
-// Schedule removal of a patient from dashboard
+/**
+ * Schedules a patient to be removed from dashboard after configured delay
+ * Used for disconnected or submitted patients (20 second fade-out period)
+ */
 function schedulePatientRemoval(clientId, reason) {
-  // Clear any existing timer for this patient
   if (removalTimers.has(clientId)) {
     clearTimeout(removalTimers.get(clientId));
-    log("INFO", `Cleared existing removal timer for "${clientId}"`);
   }
 
-  // Schedule new removal
   const timerId = setTimeout(() => {
-    log(
-      "INFO",
-      `🧹 Removing ${reason} patient "${clientId}" after ${
-        CONFIG.REMOVAL_DELAY / 1000
-      }s`
-    );
-
-    // Remove from all snapshots
     dashboardSnapshots.delete(clientId);
     patientSummaries.delete(clientId);
     removalTimers.delete(clientId);
 
-    // Notify all staff to remove this patient
-    broadcast(
-      "dashboard",
-      JSON.stringify({
-        type: "patientRemoved",
-        clientId: clientId,
-        timestamp: Date.now(),
-      })
-    );
+    broadcast("dashboard", JSON.stringify({
+      type: "patientRemoved",
+      clientId,
+      timestamp: Date.now(),
+    }));
+
+    log("INFO", `Removed ${reason} patient: ${clientId}`);
   }, CONFIG.REMOVAL_DELAY);
 
   removalTimers.set(clientId, timerId);
-  log(
-    "INFO",
-    `⏰ Scheduled ${reason} removal for "${clientId}" in ${
-      CONFIG.REMOVAL_DELAY / 1000
-    }s`
-  );
 }
 
+/**
+ * Adds a client to a room and initializes their session
+ * Handles different logic for patients vs staff, dashboard vs individual rooms
+ */
 function addClientToRoom(ws, room, clientId) {
   if (!rooms.has(room)) {
     rooms.set(room, new Set());
-    log("INFO", `Created new room: "${room}"`);
   }
 
   const roomSize = rooms.get(room).size;
@@ -199,94 +163,56 @@ function addClientToRoom(ws, room, clientId) {
     status: "online",
   });
 
-  log("INFO", `Client "${clientId || "anonymous"}" joined room "${room}"`);
-  log("INFO", `Room "${room}" now has ${rooms.get(room).size} clients`);
-
-  // PATIENT joins dashboard room - notify and create their snapshot
+  // Patient joining dashboard: create/restore their snapshot
   if (clientId && room === "dashboard" && !clientId.startsWith("staff-")) {
-    // Cancel any pending removal if patient reconnects
     if (removalTimers.has(clientId)) {
       clearTimeout(removalTimers.get(clientId));
       removalTimers.delete(clientId);
-      log(
-        "INFO",
-        `Cancelled removal timer for reconnected patient "${clientId}"`
-      );
     }
 
-    // IMPORTANT: Get existing snapshot to preserve summary data
     const existingSnapshot = dashboardSnapshots.get(clientId);
-
-    // Check if we have data in patientSummaries (from patient room)
     const patientData = patientSummaries.get(clientId);
 
-    // Determine what summary to use
+    // Preserve existing summary data or use patient room data
     let summary = {};
-    if (
-      existingSnapshot?.summary &&
-      Object.keys(existingSnapshot.summary).length > 0
-    ) {
-      // Preserve existing summary if it exists and has data
+    if (existingSnapshot?.summary && Object.keys(existingSnapshot.summary).length > 0) {
       summary = existingSnapshot.summary;
-      log(
-        "INFO",
-        `Preserving existing summary for "${clientId}" with progress: ${
-          summary.progress || 0
-        }`
-      );
     } else if (patientData) {
-      // Use patient room data if available
       summary = {
         firstName: patientData.firstName || null,
         lastName: patientData.lastName || null,
         progress: patientData.progress || 0,
         submitted: patientData.submitted || false,
       };
-      log(
-        "INFO",
-        `Using patient room data for "${clientId}" with progress: ${
-          summary.progress || 0
-        }`
-      );
     }
 
-    const reconnectSnapshot = {
+    dashboardSnapshots.set(clientId, {
       ...existingSnapshot,
-      clientId: clientId,
+      clientId,
       status: "online",
       joinedAt: existingSnapshot?.joinedAt || Date.now(),
       lastActivity: Date.now(),
-      summary: summary, // Use preserved or existing summary
-    };
-
-    dashboardSnapshots.set(clientId, reconnectSnapshot);
-    log(
-      "INFO",
-      `Updated dashboard snapshot for "${clientId}"`,
-      reconnectSnapshot
-    );
+      summary,
+    });
 
     notifyPatientConnected(clientId);
   }
 
-  // STAFF joins dashboard room - send them ALL snapshots
+  // Staff joining dashboard: send them all patient data
   if (clientId && room === "dashboard" && clientId.startsWith("staff-")) {
-    setTimeout(() => {
-      sendDashboardSnapshot(ws);
-    }, 100);
+    setTimeout(() => sendDashboardSnapshot(ws), 100);
   }
 
-  // Someone joins a PATIENT room - send them that patient's snapshot
-  if (room !== "dashboard" && room !== "lobby") {
-    if (roomSize > 0) {
-      log("INFO", `New viewer joined patient room "${room}", sending snapshot`);
-      setTimeout(() => {
-        sendCurrentSnapshotToClient(ws, room);
-      }, 100);
-    }
+  // Staff joining patient room: send them that patient's current data
+  if (room !== "dashboard" && room !== "lobby" && roomSize > 0) {
+    setTimeout(() => sendCurrentSnapshotToClient(ws, room), 100);
   }
 }
 
+/**
+ * Removes a client from their room and handles cleanup
+ * For patients: updates status to disconnected and schedules removal
+ */
 function removeClientFromRoom(ws) {
   const clientInfo = clients.get(ws);
   if (!clientInfo) return;
@@ -296,22 +222,17 @@ function removeClientFromRoom(ws) {
 
   if (roomClients) {
     roomClients.delete(ws);
-
     if (roomClients.size === 0) {
       rooms.delete(room);
-      log("INFO", `Room "${room}" is empty and removed`);
-    } else {
-      log("INFO", `Room "${room}" now has ${roomClients.size} clients`);
     }
   }
 
   clients.delete(ws);
 
-  // Handle patient disconnecting from dashboard
+  // Patient disconnecting from dashboard
   if (clientId && room === "dashboard" && !clientId.startsWith("staff-")) {
     const snapshot = dashboardSnapshots.get(clientId);
 
-    // Update snapshot status to disconnected
     if (snapshot) {
       dashboardSnapshots.set(clientId, {
         ...snapshot,
@@ -320,31 +241,28 @@ function removeClientFromRoom(ws) {
       });
     }
 
-    // Notify staff of disconnection in DASHBOARD room
+    // Notify dashboard room
     notifyPatientDisconnected(clientId);
 
-    // ALSO broadcast disconnect status to PATIENT'S individual room (for live view)
-    const disconnectStatusMessage = JSON.stringify({
+    // Notify patient's individual room (for live viewers)
+    broadcast(clientId, JSON.stringify({
       type: "status",
-      clientId: clientId,
+      clientId,
       state: "disconnected",
       timestamp: Date.now(),
-    });
-    broadcast(clientId, disconnectStatusMessage); // Broadcast to patient's own room
-    log("INFO", `📢 Broadcasted disconnect status to patient room "${clientId}"`);
+    }));
 
-    // Schedule removal after delay (unless already submitted)
+    // Schedule removal unless already submitted
     if (!snapshot?.summary?.submitted) {
       schedulePatientRemoval(clientId, "disconnected");
     }
   }
-
-  log(
-    "INFO",
-    `Client "${clientId || "anonymous"}" disconnected from room "${room}"`
-  );
 }
 
+/**
+ * Updates the last activity timestamp for a client
+ * Used for heartbeat tracking and timeout detection
+ */
 function updateClientActivity(ws) {
   const clientInfo = clients.get(ws);
   if (clientInfo) {
@@ -352,46 +270,44 @@ function updateClientActivity(ws) {
   }
 }
 
+/**
+ * Updates a client's status (online, idle, updating, disconnected)
+ */
 function updateClientStatus(ws, status) {
   const clientInfo = clients.get(ws);
   if (clientInfo) {
     clientInfo.status = status;
-    log("INFO", `Client "${clientInfo.clientId}" status: ${status}`);
   }
 }
 
-// ============================================================================
-// Notification Functions
-// ============================================================================
-
+/**
+ * Notifies dashboard that a patient has connected
+ */
 function notifyPatientConnected(clientId) {
-  const connectMessage = {
+  broadcast("dashboard", JSON.stringify({
     type: "patientConnected",
-    clientId: clientId,
+    clientId,
     timestamp: Date.now(),
-  };
-
-  broadcast("dashboard", JSON.stringify(connectMessage));
-  log("INFO", `✅ Notified dashboard: Patient "${clientId}" connected`);
+  }));
 }
 
+/**
+ * Notifies dashboard that a patient has disconnected
+ */
 function notifyPatientDisconnected(clientId) {
   const disconnectedAt = Date.now();
-  const disconnectMessage = {
+  broadcast("dashboard", JSON.stringify({
     type: "patientDisconnected",
-    clientId: clientId,
+    clientId,
     timestamp: disconnectedAt,
-    disconnectedAt: disconnectedAt,
-  };
-
-  broadcast("dashboard", JSON.stringify(disconnectMessage));
-  log("INFO", `❌ Notified dashboard: Patient "${clientId}" disconnected`);
+    disconnectedAt,
+  }));
 }
 
-// ============================================================================
-// Message Handlers
-// ============================================================================
-
+/**
+ * Main message handler - routes messages to appropriate handlers
+ * Also broadcasts messages to other clients in the same room
+ */
 function handleMessage(ws, data) {
   const msg = parseMessage(data);
   if (!msg) return;
@@ -401,85 +317,68 @@ function handleMessage(ws, data) {
   const clientInfo = clients.get(ws);
   if (!clientInfo) return;
 
-  const { room, clientId } = clientInfo;
+  const { room } = clientInfo;
 
-  log("INFO", `📨 Message from "${clientId}" in room "${room}": ${msg.type}`);
-
-  // Broadcast to same room (except sender)
+  // Broadcast to room (except sender)
   broadcast(room, JSON.stringify(msg), ws);
 
-  // Handle different message types
+  // Route to specific handler
   switch (msg.type) {
     case "summary":
     case "formSnapshot":
     case "formUpdate":
       handleFormUpdate(msg, room);
       break;
-
     case "status":
       handleStatusUpdate(ws, msg);
       break;
-
     case "submit":
       handleFormSubmit(msg, room);
       break;
-
-    default:
-      log("INFO", `Unknown message type: ${msg.type}`);
   }
 }
 
+/**
+ * Handles form update messages (summary and full snapshots)
+ * - formSnapshot: stores complete form data for patient rooms
+ * - summary: updates dashboard with patient name and progress
+ */
 function handleFormUpdate(msg, sourceRoom) {
   // Store full snapshot for patient rooms (for staff live view)
   if (sourceRoom !== "dashboard" && msg.type === "formSnapshot") {
     const existingSummary = patientSummaries.get(msg.clientId) || {};
-    const updatedSummary = {
+    patientSummaries.set(msg.clientId, {
       ...msg.payload,
       submitted: existingSummary.submitted || msg.payload?.submitted || false,
-    };
-    patientSummaries.set(msg.clientId, updatedSummary);
-    log("INFO", `💾 Updated patient room snapshot for "${msg.clientId}"`);
-
+    });
     return;
   }
 
-  // HANDLE SUMMARY MESSAGES FROM DASHBOARD ROOM (patient sending their own summary)
+  // Update dashboard snapshot from summary messages
   if (sourceRoom === "dashboard" && msg.type === "summary") {
-    const existingDashboardData = dashboardSnapshots.get(msg.clientId) || {};
-    const updatedSnapshot = {
-      ...existingDashboardData,
+    const existingData = dashboardSnapshots.get(msg.clientId) || {};
+    dashboardSnapshots.set(msg.clientId, {
+      ...existingData,
       clientId: msg.clientId,
       summary: msg.payload,
       lastActivity: Date.now(),
-      status: existingDashboardData.status || "online",
-      joinedAt: existingDashboardData.joinedAt || Date.now(),
-    };
-
-    dashboardSnapshots.set(msg.clientId, updatedSnapshot);
-    log(
-      "INFO",
-      `💾 Updated dashboard snapshot from dashboard summary for "${msg.clientId}":`,
-      updatedSnapshot
-    );
-
+      status: existingData.status || "online",
+      joinedAt: existingData.joinedAt || Date.now(),
+    });
     broadcast("dashboard", JSON.stringify(msg));
-    console.log("=== handleFormUpdate END (dashboard summary path) ===");
-    return;
-  }
-
-  // Don't forward other dashboard messages back to dashboard
-  if (sourceRoom === "dashboard") {
     return;
   }
 }
 
+/**
+ * Handles status update messages (online, idle, updating, disconnected)
+ * Updates both client metadata and dashboard snapshot
+ */
 function handleStatusUpdate(ws, msg) {
   const { clientId, state } = msg;
 
-  // Update client status in memory
   updateClientStatus(ws, state);
 
-  // UPDATE DASHBOARD SNAPSHOT if this patient is in dashboard
   if (dashboardSnapshots.has(clientId)) {
     const snapshot = dashboardSnapshots.get(clientId);
     dashboardSnapshots.set(clientId, {
@@ -487,57 +386,49 @@ function handleStatusUpdate(ws, msg) {
       status: state,
       lastActivity: Date.now(),
     });
-    log(
-      "INFO",
-      `💾 Updated status in dashboard snapshot for "${clientId}": ${state}`
-    );
   }
-
-  log("INFO", `🔔 Status update from "${clientId}": ${state}`);
 }
 
+/**
+ * Handles form submission
+ * Updates both patient room and dashboard, then schedules removal
+ */
 function handleFormSubmit(msg, sourceRoom) {
-  log("INFO", `✅ Form submitted by "${msg.clientId}"`);
-
   const submittedAt = Date.now();
   const submittedData = {
     ...msg.payload,
     submitted: true,
-    submittedAt: submittedAt,
+    submittedAt,
     progress: msg.payload?.progress ?? 100,
   };
 
-  // Store in patient room snapshot
+  // Store in patient room
   patientSummaries.set(msg.clientId, submittedData);
 
-  // UPDATE DASHBOARD SNAPSHOT
-  const existingDashboardData = dashboardSnapshots.get(msg.clientId) || {};
+  // Update dashboard snapshot
+  const existingData = dashboardSnapshots.get(msg.clientId) || {};
   dashboardSnapshots.set(msg.clientId, {
-    ...existingDashboardData,
+    ...existingData,
     clientId: msg.clientId,
     status: "online",
     lastActivity: submittedAt,
-    joinedAt: existingDashboardData.joinedAt || submittedAt,
+    joinedAt: existingData.joinedAt || submittedAt,
     summary: {
       firstName: submittedData.firstName || null,
       lastName: submittedData.lastName || null,
       progress: 100,
       submitted: true,
-      submittedAt: submittedAt,
+      submittedAt,
     },
   });
-  log(
-    "INFO",
-    `💾 Updated dashboard snapshot with submission for "${msg.clientId}"`
-  );
 
-  // Broadcast to patient's room
+  // Broadcast to patient room
   if (sourceRoom !== "dashboard") {
     broadcast(sourceRoom, JSON.stringify(msg));
   }
 
-  // Forward to dashboard
-  const submitNotification = {
+  // Notify dashboard
+  broadcast("dashboard", JSON.stringify({
     type: "summary",
     clientId: msg.clientId,
     payload: {
@@ -545,182 +436,106 @@ function handleFormSubmit(msg, sourceRoom) {
       lastName: submittedData.lastName || null,
       progress: 100,
       submitted: true,
-      submittedAt: submittedAt,
+      submittedAt,
     },
     timestamp: submittedAt,
-  };
+  }));
 
-  broadcast("dashboard", JSON.stringify(submitNotification));
-  log("INFO", `📤 Notified dashboard of submission for "${msg.clientId}"`);
-
-  // Schedule removal from dashboard after delay
   schedulePatientRemoval(msg.clientId, "submitted");
+  log("INFO", `Form submitted: ${msg.clientId}`);
 }
 
-// ============================================================================
-// Connection Management
-// ============================================================================
-
+/**
+ * Sets up periodic heartbeat to detect stale connections
+ * Pings clients every 30s, terminates if no response for 60s
+ */
 function setupHeartbeat() {
   const interval = setInterval(() => {
     const now = Date.now();
 
     clients.forEach((clientInfo, ws) => {
-      // Check if client is stale
       if (now - clientInfo.lastActivity > CONFIG.CLIENT_TIMEOUT) {
-        log(
-          "WARN",
-          `⏱️  Client "${clientInfo.clientId}" timed out - terminating`
-        );
+        log("WARN", `Client timeout: ${clientInfo.clientId}`);
         ws.terminate();
         return;
       }
 
-      // Send ping
       if (ws.readyState === ws.OPEN) {
         try {
           ws.ping();
         } catch (err) {
-          log("ERROR", `Failed to ping client "${clientInfo.clientId}":`, err);
+          log("ERROR", `Ping failed for ${clientInfo.clientId}:`, err);
         }
       }
     });
   }, CONFIG.HEARTBEAT_INTERVAL);
 
-  log(
-    "INFO",
-    `💓 Heartbeat started (interval: ${CONFIG.HEARTBEAT_INTERVAL}ms)`
-  );
   return interval;
 }
 
+/**
+ * Extracts room and clientId from WebSocket connection request URL
+ */
 function getRoomFromRequest(req) {
   const url = new URL(req.url || "/", `http://${req.headers.host}`);
-  const room = url.searchParams.get("room") || "lobby";
-  const clientId = url.searchParams.get("clientId") || undefined;
-
-  return { room, clientId };
+  return {
+    room: url.searchParams.get("room") || "lobby",
+    clientId: url.searchParams.get("clientId") || undefined,
+  };
 }
 
 // ============================================================================
-// WebSocket Server Setup
+// Server Initialization
 // ============================================================================
 
 const wss = new WebSocketServer({ port: CONFIG.PORT });
 
-log("INFO", `🚀 WebSocket server listening on ws://0.0.0.0:${CONFIG.PORT}`);
-log(
-  "INFO",
-  `⚙️  Configuration: Heartbeat=${CONFIG.HEARTBEAT_INTERVAL}ms, Timeout=${CONFIG.CLIENT_TIMEOUT}ms, Removal Delay=${CONFIG.REMOVAL_DELAY}ms`
-);
+log("INFO", `🚀 WebSocket server started on port ${CONFIG.PORT}`);
 
 wss.on("connection", (ws, req) => {
   const { room, clientId } = getRoomFromRequest(req);
 
-  log(
-    "INFO",
-    `🔌 New connection - Room: "${room}", ClientId: "${clientId || "none"}"`
-  );
-
   addClientToRoom(ws, room, clientId);
 
-  // Handle incoming messages
-  ws.on("message", (data) => {
-    handleMessage(ws, data);
-  });
-
-  // Handle pong (response to ping)
-  ws.on("pong", () => {
-    updateClientActivity(ws);
-  });
-
-  // Handle errors
+  ws.on("message", (data) => handleMessage(ws, data));
+  ws.on("pong", () => updateClientActivity(ws));
   ws.on("error", (error) => {
     const clientInfo = clients.get(ws);
-    log(
-      "ERROR",
-      `⚠️  WebSocket error for "${clientInfo?.clientId}":`,
-      error.message
-    );
+    log("ERROR", `WebSocket error for ${clientInfo?.clientId}:`, error.message);
   });
-
-  // Handle disconnection
-  ws.on("close", (code, reason) => {
-    const clientInfo = clients.get(ws);
-    log(
-      "INFO",
-      `👋 Client "${clientInfo?.clientId}" closing - Code: ${code}, Reason: ${
-        reason || "none"
-      }`
-    );
-    removeClientFromRoom(ws);
-  });
+  ws.on("close", () => removeClientFromRoom(ws));
 
   // Send welcome message
   try {
-    ws.send(
-      JSON.stringify({
-        type: "connected",
-        clientId: clientId || "anonymous",
-        room,
-        timestamp: Date.now(),
-        message: "Welcome to the WebSocket server",
-      })
-    );
+    ws.send(JSON.stringify({
+      type: "connected",
+      clientId: clientId || "anonymous",
+      room,
+      timestamp: Date.now(),
+    }));
   } catch (err) {
     log("ERROR", "Failed to send welcome message:", err);
   }
 });
 
 // ============================================================================
-// Server Lifecycle & Monitoring
+// Background Tasks
 // ============================================================================
 
-// Setup heartbeat
 const heartbeatInterval = setupHeartbeat();
 
-// Log server stats periodically
+// Periodic stats logging
 const statsInterval = setInterval(() => {
-  log(
-    "INFO",
-    `📊 Server stats - Rooms: ${rooms.size}, Total clients: ${clients.size}, Dashboard snapshots: ${dashboardSnapshots.size}, Patient snapshots: ${patientSummaries.size}, Pending removals: ${removalTimers.size}`
-  );
-
-  // Log room details
-  rooms.forEach((clientSet, roomId) => {
-    const clientList = Array.from(clientSet)
-      .map((ws) => {
-        const info = clients.get(ws);
-        return info ? `${info.clientId}(${info.status})` : "unknown";
-      })
-      .join(", ");
-
-    log(
-      "INFO",
-      `   Room "${roomId}": ${clientSet.size} client(s) - [${clientList}]`
-    );
-  });
-
-  // Log dashboard snapshots
-  if (dashboardSnapshots.size > 0) {
-    const snapshotList = Array.from(dashboardSnapshots.entries())
-      .map(([id, snap]) => {
-        const status = snap.summary?.submitted ? "submitted" : snap.status;
-        return `${id.substring(0, 8)}(${status})`;
-      })
-      .join(", ");
-    log("INFO", `   Dashboard snapshots: [${snapshotList}]`);
-  }
+  log("INFO", `📊 Rooms: ${rooms.size}, Clients: ${clients.size}, Patients: ${dashboardSnapshots.size}`);
 }, CONFIG.STATS_INTERVAL);
 
-// Failsafe cleanup for very old records (in case timers fail)
+// Failsafe cleanup for very old records
 const cleanupInterval = setInterval(() => {
   const now = Date.now();
-  const CLEANUP_AGE = 120000; // 2 minutes (failsafe)
+  const CLEANUP_AGE = 120000;
 
   dashboardSnapshots.forEach((snapshot, clientId) => {
-    const eventTimestamp =
-      snapshot.summary?.submittedAt || snapshot.lastActivity;
+    const eventTimestamp = snapshot.summary?.submittedAt || snapshot.lastActivity;
     if (eventTimestamp && now - eventTimestamp > CLEANUP_AGE) {
       dashboardSnapshots.delete(clientId);
       patientSummaries.delete(clientId);
@@ -728,67 +543,57 @@ const cleanupInterval = setInterval(() => {
         clearTimeout(removalTimers.get(clientId));
         removalTimers.delete(clientId);
       }
-      log(
-        "INFO",
-        `🧹 Failsafe cleanup for old patient "${clientId}" (age: ${Math.round(
-          (now - eventTimestamp) / 1000
-        )}s)`
-      );
     }
   });
-}, 60000); // Check every minute
+}, 60000);
 
-// Graceful shutdown handler
+// ============================================================================
+// Graceful Shutdown
+// ============================================================================
+
+/**
+ * Handles graceful server shutdown
+ * Clears intervals, notifies clients, and closes connections
+ */
 function shutdown(signal) {
-  log("INFO", `${signal} received - shutting down gracefully...`);
+  log("INFO", `${signal} - shutting down...`);
 
   clearInterval(heartbeatInterval);
   clearInterval(statsInterval);
   clearInterval(cleanupInterval);
 
-  // Clear all removal timers
   removalTimers.forEach((timerId) => clearTimeout(timerId));
   removalTimers.clear();
 
-  // Notify all clients about shutdown
   wss.clients.forEach((ws) => {
     try {
-      ws.send(
-        JSON.stringify({
-          type: "serverShutdown",
-          message: "Server is shutting down",
-          timestamp: Date.now(),
-        })
-      );
-    } catch (err) {
-      // Ignore errors when notifying
-    }
+      ws.send(JSON.stringify({
+        type: "serverShutdown",
+        timestamp: Date.now(),
+      }));
+    } catch (err) {}
     ws.close(1000, "Server shutting down");
   });
 
   wss.close(() => {
-    log("INFO", "✅ WebSocket server closed successfully");
+    log("INFO", "✅ Server closed");
     process.exit(0);
   });
 
-  // Force exit after 5 seconds if graceful shutdown fails
   setTimeout(() => {
-    log("ERROR", "⚠️  Forced shutdown after timeout");
+    log("ERROR", "⚠️ Forced shutdown");
     process.exit(1);
   }, 5000);
 }
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
-
-// Handle uncaught errors
 process.on("uncaughtException", (err) => {
-  log("ERROR", "💥 Uncaught Exception:", err);
+  log("ERROR", "Uncaught exception:", err);
   shutdown("UNCAUGHT_EXCEPTION");
 });
-
 process.on("unhandledRejection", (reason, promise) => {
-  log("ERROR", "💥 Unhandled Rejection at:", promise, "reason:", reason);
+  log("ERROR", "Unhandled rejection:", reason);
 });
 
-log("INFO", "✅ WebSocket server initialization complete");
+log("INFO", "✅ Server initialization complete");
