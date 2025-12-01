@@ -63,24 +63,42 @@ function broadcast(roomId, message, except) {
 }
 
 // Send current snapshot to a specific client (staff joining patient room)
+// Send current snapshot to a specific client (staff joining patient room)
 function sendCurrentSnapshotToClient(ws, patientId) {
   const summary = patientSummaries.get(patientId);
+  const dashboardData = dashboardSnapshots.get(patientId);
 
-  if (summary) {
+  if (summary || dashboardData) {
     log(
       "INFO",
       `📋 Sending current snapshot to new client in room "${patientId}"`
     );
 
     try {
-      ws.send(
-        JSON.stringify({
-          type: "formSnapshot",
-          clientId: patientId,
-          payload: summary,
-          timestamp: Date.now(),
-        })
-      );
+      // Send form snapshot if available
+      if (summary) {
+        ws.send(
+          JSON.stringify({
+            type: "formSnapshot",
+            clientId: patientId,
+            payload: summary,
+            timestamp: Date.now(),
+          })
+        );
+      }
+
+      // ALSO send current status
+      if (dashboardData && dashboardData.status) {
+        ws.send(
+          JSON.stringify({
+            type: "status",
+            clientId: patientId,
+            state: dashboardData.status,
+            timestamp: Date.now(),
+          })
+        );
+        log("INFO", `📋 Sent current status: ${dashboardData.status}`);
+      }
     } catch (err) {
       log("ERROR", "Failed to send snapshot to client:", err);
     }
@@ -198,16 +216,24 @@ function addClientToRoom(ws, room, clientId) {
 
     // IMPORTANT: Get existing snapshot to preserve summary data
     const existingSnapshot = dashboardSnapshots.get(clientId);
-    
+
     // Check if we have data in patientSummaries (from patient room)
     const patientData = patientSummaries.get(clientId);
-    
+
     // Determine what summary to use
     let summary = {};
-    if (existingSnapshot?.summary && Object.keys(existingSnapshot.summary).length > 0) {
+    if (
+      existingSnapshot?.summary &&
+      Object.keys(existingSnapshot.summary).length > 0
+    ) {
       // Preserve existing summary if it exists and has data
       summary = existingSnapshot.summary;
-      log("INFO", `Preserving existing summary for "${clientId}" with progress: ${summary.progress || 0}`);
+      log(
+        "INFO",
+        `Preserving existing summary for "${clientId}" with progress: ${
+          summary.progress || 0
+        }`
+      );
     } else if (patientData) {
       // Use patient room data if available
       summary = {
@@ -216,7 +242,12 @@ function addClientToRoom(ws, room, clientId) {
         progress: patientData.progress || 0,
         submitted: patientData.submitted || false,
       };
-      log("INFO", `Using patient room data for "${clientId}" with progress: ${summary.progress || 0}`);
+      log(
+        "INFO",
+        `Using patient room data for "${clientId}" with progress: ${
+          summary.progress || 0
+        }`
+      );
     }
 
     const reconnectSnapshot = {
@@ -225,11 +256,15 @@ function addClientToRoom(ws, room, clientId) {
       status: "online",
       joinedAt: existingSnapshot?.joinedAt || Date.now(),
       lastActivity: Date.now(),
-      summary: summary,  // Use preserved or existing summary
+      summary: summary, // Use preserved or existing summary
     };
-    
+
     dashboardSnapshots.set(clientId, reconnectSnapshot);
-    log("INFO", `Updated dashboard snapshot for "${clientId}"`, reconnectSnapshot);
+    log(
+      "INFO",
+      `Updated dashboard snapshot for "${clientId}"`,
+      reconnectSnapshot
+    );
 
     notifyPatientConnected(clientId);
   }
@@ -394,7 +429,7 @@ function handleFormUpdate(msg, sourceRoom) {
     };
     patientSummaries.set(msg.clientId, updatedSummary);
     log("INFO", `💾 Updated patient room snapshot for "${msg.clientId}"`);
-  
+
     return;
   }
 
@@ -409,10 +444,14 @@ function handleFormUpdate(msg, sourceRoom) {
       status: existingDashboardData.status || "online",
       joinedAt: existingDashboardData.joinedAt || Date.now(),
     };
-    
+
     dashboardSnapshots.set(msg.clientId, updatedSnapshot);
-    log("INFO", `💾 Updated dashboard snapshot from dashboard summary for "${msg.clientId}":`, updatedSnapshot);
-    
+    log(
+      "INFO",
+      `💾 Updated dashboard snapshot from dashboard summary for "${msg.clientId}":`,
+      updatedSnapshot
+    );
+
     broadcast("dashboard", JSON.stringify(msg));
     console.log("=== handleFormUpdate END (dashboard summary path) ===");
     return;
