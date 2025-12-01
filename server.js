@@ -320,8 +320,18 @@ function removeClientFromRoom(ws) {
       });
     }
 
-    // Notify staff of disconnection immediately
+    // Notify staff of disconnection in DASHBOARD room
     notifyPatientDisconnected(clientId);
+
+    // ALSO broadcast disconnect status to PATIENT'S individual room (for live view)
+    const disconnectStatusMessage = JSON.stringify({
+      type: "status",
+      clientId: clientId,
+      state: "disconnected",
+      timestamp: Date.now(),
+    });
+    broadcast(clientId, disconnectStatusMessage); // Broadcast to patient's own room
+    log("INFO", `📢 Broadcasted disconnect status to patient room "${clientId}"`);
 
     // Schedule removal after delay (unless already submitted)
     if (!snapshot?.summary?.submitted) {
